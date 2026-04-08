@@ -17,7 +17,7 @@ The core prediction task is: **will the tendered primary carrier accept a load?*
 
 | Name | Role |
 |---|---|
-| Yuhao Ren | Exploratory Data Analysis (R) | Predictive Pipeline & Repository (Python) |
+| Yuhao Ren | Exploratory Data Analysis (R) & Predictive Pipeline & Repository (Python) |
 | Aidan McIndoe | Key Visualizations (R) |
 | Michael Zheng | Predictive Pipeline (Python) |
 
