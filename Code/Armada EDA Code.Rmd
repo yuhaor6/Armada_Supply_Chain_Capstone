@@ -1,0 +1,690 @@
+---
+title: "Armada EDA"
+author: "Franco Ren"
+date: "2025-09-17"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(arrow)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(lme4)
+library(DHARMa)
+library(broom.mixed)
+```
+
+```{r}
+files <- list.files(pattern = "CMU_ARMADA_LOADS_202403-202502_.*\\.xlsx$")
+files
+```
+
+```{r}
+# read and append
+dfs <- lapply(files, function(f) read_excel(f, guess_max = 100000))
+
+# force them all to character to avoid type mismatch
+dfs <- lapply(dfs, function(df) mutate_all(df, as.character))
+
+# append into one big dataframe
+combined <- bind_rows(dfs)
+
+combined <- readr::type_convert(combined, na = c("", "NA", "N/A", "NULL"))
+
+#names unified
+combined <- janitor::clean_names(combined)
+
+#choose numeric targets
+num_cols <- c(
+  "mileage","contract_linehaul","spot_linehaul","paid_linehaul","nap_linehaul",
+  "cube","weight","pieces","quantity","transit_time","number_of_stops"
+)
+
+char_num_cols <- intersect(
+  num_cols,
+  names(combined)[vapply(combined, is.character, logical(1))]
+)
+
+combined <- combined %>%
+  mutate(across(all_of(char_num_cols), readr::parse_number))
+```
+```{r}
+#parse month from TIME_PERIOD
+combined <- combined %>%
+  mutate(
+    time_period = as.character(time_period),
+    month_date  = lubridate::parse_date_time(time_period, orders = c("b_Y","B_Y")),
+    month       = lubridate::floor_date(month_date, "month")
+  )
+```
+
+```{r}
+# Loads by month
+monthly_loads <- combined %>%
+  count(month, name = "loads") %>%
+  arrange(month) %>%
+  mutate(month_label = format(month, "%b %Y"))
+
+monthly_loads
+
+monthly_loads <- monthly_loads %>%
+  mutate(month = as.Date(month))
+
+ggplot(monthly_loads, aes(x = month, y = loads)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(color = "darkred") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y", expand = c(0.01, 0.01)) +
+  labs(title = "Monthly Load Volume", x = "Month", y = "Loads") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+# Top 10 origin states
+top_origin_states <- combined %>%
+  count(originstate, name = "loads") %>%
+  arrange(desc(loads)) %>%
+  slice_head(n = 10)
+
+# Top 10 destination states
+top_dest_states <- combined %>%
+  count(destinationstate, name = "loads") %>%
+  arrange(desc(loads)) %>%
+  slice_head(n = 10)
+
+ggplot(top_origin_states,
+       aes(x = reorder(originstate, loads), y = loads)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Origin States by Load Volume",
+       x = "Origin State",
+       y = "Number of Loads") +
+  theme_minimal()
+
+ggplot(top_dest_states,
+       aes(x = reorder(destinationstate, loads), y = loads)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 10 Destination States by Load Volume",
+       x = "Destination State",
+       y = "Number of Loads") +
+  theme_minimal()
+```
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+
+#Define the trusted window
+start_date <- as.Date("2024-03-01")
+end_date   <- as.Date("2025-02-28")
+
+# Convert date columns
+date_cols <- c(
+  "pick_due_date","pick_departure_date","pick_actual_date","pick_appt_date",
+  "drop_due_date","drop_departure_date","drop_actual_date","drop_appt_date"
+)
+combined <- combined %>%
+  mutate(across(all_of(intersect(names(.), date_cols)), as.Date))
+
+# Filter to the analysis window using pick_actual_date
+df <- combined %>%
+  filter(!is.na(pick_actual_date),
+         pick_actual_date >= start_date,
+         pick_actual_date <= end_date) %>%
+  mutate(
+    month = floor_date(pick_actual_date, "month"),
+    week  = floor_date(pick_actual_date, "week"),
+    # timing features
+    transit_days = as.numeric(drop_actual_date - pick_actual_date),
+    pick_delay_d = as.numeric(pick_actual_date - pick_appt_date),
+    drop_delay_d = as.numeric(drop_actual_date - drop_appt_date)
+  )
+
+#missing %
+date_missing <- df %>% summarise(across(all_of(date_cols), ~mean(is.na(.))))
+print(t(date_missing))
+
+date_ranges <- df %>% summarise(across(all_of(date_cols),
+                                       ~paste0(as.character(min(., na.rm=TRUE)),
+                                               " → ",
+                                               as.character(max(., na.rm=TRUE)))))
+print(t(date_ranges))
+
+on_time <- c(
+  on_time_pick = mean(coalesce(df$pick_delay_d <= 0, FALSE)),
+  on_time_drop = mean(coalesce(df$drop_delay_d <= 0, FALSE))
+)
+print(on_time)
+
+# Clip outliers (1–99% quantiles)
+q <- function(x, p) suppressWarnings(quantile(x, probs = p, na.rm = TRUE))
+pick_lo <- q(df$pick_delay_d, 0.01); pick_hi <- q(df$pick_delay_d, 0.99)
+drop_lo <- q(df$drop_delay_d, 0.01); drop_hi <- q(df$drop_delay_d, 0.99)
+tran_lo <- q(df$transit_days, 0.01); tran_hi <- q(df$transit_days, 0.99)
+
+df <- df %>%
+  mutate(
+    pick_delay_clip = pmin(pmax(pick_delay_d, pick_lo),  pick_hi),
+    drop_delay_clip = pmin(pmax(drop_delay_d, drop_lo),  drop_hi),
+    transit_clip    = pmin(pmax(transit_days, tran_lo),  tran_hi)
+  )
+
+# Time series: Monthly & Weekly Loads
+monthly_loads <- df %>% count(month, name = "loads") %>% arrange(month)
+weekly_loads  <- df %>% count(week,  name = "loads") %>% arrange(week)
+
+ggplot(monthly_loads, aes(month, loads)) +
+  geom_col() +
+  scale_x_date(limits = c(start_date, end_date),
+               date_breaks = "1 month", date_labels = "%b %Y", expand = c(0,0)) +
+  labs(title = "Monthly Pickups", x = "Month", y = "Loads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(weekly_loads, aes(week, loads)) +
+  geom_line(linewidth = 1) + geom_point(size = 1.4) +
+  scale_x_date(limits = c(start_date, end_date),
+               date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "Weekly Pickups", x = "Week", y = "Loads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Delay & Transit distributions (clipped)
+ggplot(df, aes(pick_delay_clip)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Pickup Delay (days, clipped 1–99%)",
+       x = "Days (Actual - Appt)", y = "Loads")
+
+ggplot(df, aes(drop_delay_clip)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Drop Delay (days, clipped 1–99%)",
+       x = "Days (Actual - Appt)", y = "Loads")
+
+ggplot(df, aes(transit_clip)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Transit Time (days, clipped 1–99%)",
+       x = "Days", y = "Loads")
+
+# lane heatmap
+top_orig <- df %>% count(originstate, sort = TRUE) %>% slice_head(n = 12) %>% pull(originstate)
+top_dest <- df %>% count(destinationstate, sort = TRUE) %>% slice_head(n = 12) %>% pull(destinationstate)
+
+flow_heat <- df %>%
+  filter(originstate %in% top_orig, destinationstate %in% top_dest) %>%
+  count(originstate, destinationstate, name = "loads") %>%
+  mutate(
+    originstate      = fct_reorder(originstate,      loads, .fun = sum),
+    destinationstate = fct_reorder(destinationstate, loads, .fun = sum)
+  )
+
+ggplot(flow_heat, aes(originstate, destinationstate, fill = loads)) +
+  geom_tile() +
+  scale_fill_continuous(trans = "log10") +
+  labs(title = "Top State↔State Lanes (log scale)",
+       x = "Origin", y = "Destination", fill = "Loads") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+#all states
+flow_heat_all <- df %>%
+  count(originstate, destinationstate, name = "loads") %>%
+  filter(!is.na(originstate), !is.na(destinationstate))
+
+ggplot(flow_heat_all, aes(originstate, destinationstate, fill = loads)) +
+  geom_tile() +
+  scale_fill_continuous(trans = "log10") +   # log scale keeps extreme lanes visible
+  labs(title = "All State↔State Lanes (log scale)",
+       x = "Origin", y = "Destination", fill = "Loads") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+# Top-25 lanes table 
+lane_counts <- df %>%
+  count(originstate, destinationstate, name = "loads") %>%
+  arrange(desc(loads)) %>% slice_head(n = 25)
+lane_counts
+
+# Top origins and destinations
+top_origins <- combined %>%
+  count(originid, sort = TRUE) %>%
+  slice_head(n = 20)
+
+top_destinations <- combined %>%
+  count(destinationid, sort = TRUE) %>%
+  slice_head(n = 20)
+
+print(top_origins)
+print(top_destinations)
+
+# Distribution plots
+ggplot(top_origins, aes(x = reorder(originid, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Origin IDs", x = "Origin ID", y = "Loads")
+
+ggplot(top_destinations, aes(x = reorder(destinationid, n), y = n)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 20 Destination IDs", x = "Destination ID", y = "Loads")
+
+# Lane-level counts (origin to destination pairs)
+lane_counts <- combined %>%
+  count(originid, destinationid, sort = TRUE)
+
+head(lane_counts, 20)
+
+# Heatmap of top lanes
+lane_top <- lane_counts %>%
+  slice_head(n = 50)   # adjust number if want more
+
+ggplot(lane_top, aes(x = originid, y = destinationid, fill = n)) +
+  geom_tile() +
+  scale_fill_viridis_c(trans = "log10") +
+  labs(title = "Top Origin-Destination Lanes (log scale)", fill = "Loads") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+```
+
+```{r}
+top_customers <- combined %>% 
+  count(customer_skey, sort = TRUE) %>% 
+  slice_head(n = 10)
+
+top_customers
+
+top_carriers <- combined %>% 
+  count(carrier_skey, sort = TRUE) %>% 
+  slice_head(n = 10)
+
+top_carriers
+
+combined %>% 
+  count(destination_region) %>%    
+  filter(n > 10) %>%           
+  summarise(num_regions = n()) 
+```
+
+```{r}
+df <- df %>%
+  mutate(
+    rate_premium = ifelse(
+      !is.na(spot_linehaul) & spot_linehaul > 0,
+      100 * (paid_linehaul - spot_linehaul) / spot_linehaul,
+      NA_real_
+    )
+  )
+summary(df$rate_premium)
+
+# check missingness and distribution by award type
+df %>%
+  group_by(award_type) %>%
+  summarise(
+    n = n(),
+    missing = mean(is.na(rate_premium)),
+    avg_premium = mean(rate_premium, na.rm = TRUE),
+    median_premium = median(rate_premium, na.rm = TRUE)
+  )
+
+
+market_premium <- df %>%
+  filter(!is.na(originstate)) %>% 
+  group_by(originstate) %>%
+  summarise(avg_premium = mean(rate_premium, na.rm = TRUE)) %>%
+  arrange(desc(avg_premium))
+
+```
+```{r}
+ggplot(market_premium,
+       aes(x = reorder(originstate, avg_premium), y = avg_premium)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Origin States by Average Rate Premium",
+    x = "Origin State",
+    y = "Avg Premium (%)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+dest_premium <- df %>%
+  filter(!is.na(destinationstate)) %>% # drop missing values
+  group_by(destinationstate) %>%
+  summarise(avg_premium = mean(rate_premium, na.rm = TRUE)) %>%
+```
+
+
+```{r}
+arrange(desc(avg_premium))
+
+ggplot(dest_premium,
+       aes(x = reorder(destinationstate, avg_premium), y = avg_premium)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Destination States by Average Rate Premium",
+    x = "Destination State",
+    y = "Avg Premium (%)"
+  ) +
+  theme_minimal()
+```
+```{r}
+inbound <- df %>%
+  filter(!is.na(destinationstate)) %>%
+  group_by(destinationstate) %>%
+  summarise(inbound_loads = n())
+
+outbound <- df %>%
+  filter(!is.na(originstate)) %>%
+  group_by(originstate) %>%
+  summarise(outbound_loads = n())
+
+flow_balance <- full_join(outbound, inbound,
+                          by = c("originstate" = "destinationstate")) %>%
+  rename(market = originstate) %>%
+  mutate(
+    inbound_loads  = coalesce(inbound_loads, 0),
+    outbound_loads = coalesce(outbound_loads, 0),
+    total_loads    = inbound_loads + outbound_loads
+  )
+
+flow_balance <- flow_balance %>%
+  mutate(
+    in_out_ratio = ifelse(outbound_loads > 0,
+                          inbound_loads / outbound_loads, NA_real_),
+    balance_type = case_when(
+      in_out_ratio < 0.8 ~ "Headhaul",
+      in_out_ratio > 1.2 ~ "Deadhaul",
+      TRUE               ~ "Balanced"
+    )
+  )
+
+market_premium <- df %>%
+  filter(!is.na(originstate)) %>%
+  group_by(originstate) %>%
+  summarise(avg_premium = mean(rate_premium, na.rm = TRUE))
+
+# Join
+flow_premium <- flow_balance %>%
+  left_join(market_premium, by = c("market" = "originstate"))
+
+ggplot(flow_premium, aes(x = balance_type, y = avg_premium, fill = balance_type)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  scale_fill_manual(values = c("Headhaul" = "#1b9e77", 
+                               "Balanced" = "#7570b3", 
+                               "Deadhaul" = "#d95f02")) +
+  labs(
+    title = "Rate Premium by Market Balance Type",
+    x = "Market Type",
+    y = "Average Rate Premium (%)"
+  ) +
+  theme_minimal()
+
+fb_us <- flow_balance %>%
+  mutate(market = toupper(market)) %>%
+  filter(market %in% usmap::statepop$abbr) %>%         # U.S. only
+  mutate(balance_type = recode(balance_type, "Deadhaul" = "Backhaul (Deadhaul)"))
+
+headhaul_states  <- fb_us %>% filter(balance_type == "Headhaul")            %>% arrange(desc(in_out_ratio)) %>% pull(market)
+backhaul_states  <- fb_us %>% filter(balance_type == "Backhaul (Deadhaul)") %>% arrange(desc(in_out_ratio)) %>% pull(market)
+balanced_states  <- fb_us %>% filter(balance_type == "Balanced")            %>% arrange(desc(in_out_ratio)) %>% pull(market)
+
+headhaul_states
+backhaul_states
+balanced_states
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(usmap)
+library(forcats)
+
+flow_balance <- flow_balance %>%
+  mutate(market = toupper(market))
+
+flow_balance_map <- flow_balance %>%
+  left_join(usmap::statepop %>% select(fips, abbr),
+            by = c("market" = "abbr"))
+
+us_abbr <- usmap::statepop$abbr  #US state codes
+
+flow_us <- flow_balance_map %>%
+  filter(market %in% us_abbr) # keep only US rows
+
+plot_usmap(
+  data    = flow_us,
+  values  = "balance_type",
+  regions = "states"
+) +
+  scale_fill_manual(
+    values = c("Headhaul" = "darkblue",
+               "Balanced" = "#BDBDBD",
+               "Deadhaul" = "darkorange",
+               "NA" = "#EEEEEE"),
+    na.value = "grey90",
+    name = "Market type"
+  ) +
+  labs(title = "Market Balance by State (Inbound/Outbound Ratio)",
+       subtitle = "Headhaul (<0.8), Balanced (0.8–1.2), Backhaul (>1.2)") +
+  theme(legend.position = "right")
+```
+```{r}
+
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+min_loads <- 50  # filter tiny markets so stats are stable
+
+market_o <- df %>%
+  mutate(month = floor_date(pick_actual_date, "month"),
+         rate_premium = ifelse(spot_linehaul > 0,
+                               100*(paid_linehaul - spot_linehaul)/spot_linehaul,
+                               NA_real_)) %>%
+  filter(!is.na(originstate)) %>%
+  group_by(originstate) %>%
+  summarise(
+    loads                = n(),
+    uniq_carriers        = n_distinct(carrier_skey),
+    # a repeat carrier handled >= 3 loads in this market
+    repeat_carriers      = n_distinct(carrier_skey[carrier_skey %in%
+                                   names(which(table(carrier_skey) >= 3))]),
+    months_active        = n_distinct(month),
+    loads_per_carrier    = loads / pmax(uniq_carriers, 1),
+    carriers_per_100L    = 100 * uniq_carriers / pmax(loads,1),
+    repeat_share         = repeat_carriers / pmax(uniq_carriers,1),
+    prem_mean            = mean(rate_premium, na.rm = TRUE),
+    prem_sd              = sd(rate_premium, na.rm = TRUE),
+    mileage_med          = median(mileage, na.rm = TRUE),
+    transit_med          = median(as.numeric(drop_actual_date - pick_actual_date), na.rm = TRUE),
+    leadtime_med         = median(load_lead_time, na.rm = TRUE),
+    stops_med            = median(number_of_stops, na.rm = TRUE)
+  ) %>%
+  filter(loads >= min_loads) %>%
+  ungroup()
+
+# Does higher premium come with lower engagement?
+cor.test(market_o$prem_mean, market_o$carriers_per_100L, method = "spearman")
+cor.test(market_o$prem_mean, market_o$repeat_share,      method = "spearman")
+
+# Scatter to eyeball the slope
+library(ggplot2)
+ggplot(market_o, aes(prem_mean, carriers_per_100L)) +
+  geom_point(alpha = 0.6) + geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Avg rate premium (%)", y = "Unique carriers per 100 loads")
+```
+```{r}
+market_d <- df %>%
+  filter(!is.na(destinationstate)) %>%
+  group_by(destinationstate) %>%
+  summarise(
+    loads                = n(),
+    uniq_carriers        = n_distinct(carrier_skey),
+    months_active        = n_distinct(month),
+    loads_per_carrier    = loads / pmax(uniq_carriers, 1),
+    carriers_per_100L    = 100 * uniq_carriers / pmax(loads, 1),
+    repeat_carriers      = n_distinct(carrier_skey[carrier_skey %in%
+                                   names(which(table(carrier_skey) >= 3))]),
+    repeat_share         = repeat_carriers / pmax(uniq_carriers, 1),
+    prem_mean            = mean(rate_premium, na.rm = TRUE),
+    prem_sd              = sd(rate_premium, na.rm = TRUE),
+    mileage_med          = median(mileage, na.rm = TRUE),
+    transit_med          = median(as.numeric(drop_actual_date - pick_actual_date), na.rm = TRUE),
+    leadtime_med         = median(load_lead_time, na.rm = TRUE),
+    stops_med            = median(number_of_stops, na.rm = TRUE)
+  ) %>%
+  filter(loads >= min_loads) %>% 
+  ungroup()
+
+# Spearman correlations
+cor.test(market_d$prem_mean, market_d$carriers_per_100L, method = "spearman")
+cor.test(market_d$prem_mean, market_d$repeat_share,      method = "spearman")
+
+ggplot(market_d, aes(prem_mean, carriers_per_100L)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Avg rate premium (%)", y = "Unique carriers per 100 loads",
+       title = "Destination markets: premium vs carrier breadth")
+
+ggplot(market_d, aes(prem_mean, repeat_share)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Avg rate premium (%)", y = "Repeat-carrier share",
+       title = "Destination markets: premium vs carrier stickiness")
+```
+```{r}
+z <- function(x) as.numeric(scale(x))
+market_d <- market_d %>%
+  mutate(
+    CAI_rule =  + z(carriers_per_100L)      # breadth
+                + z(repeat_share)           # stickiness
+                + z(loads_per_carrier)      # commitment
+                - z(prem_mean)              # risk pricing
+                - z(prem_sd)                # price volatility
+                - z(mileage_med) - z(transit_med) - z(stops_med)
+  ) %>%
+  arrange(desc(CAI_rule))
+```
+
+```{r}
+library(tidymodels)
+set.seed(1)
+
+market_d2 <- market_d %>%
+  mutate(engagement = z(carriers_per_100L) + z(repeat_share) + z(loads_per_carrier)) %>%
+  select(destinationstate, engagement,
+         prem_mean, prem_sd, mileage_med, transit_med, leadtime_med, stops_med, loads)
+
+spl <- initial_split(market_d2, prop=.8, strata=engagement)
+tr <- training(spl); te <- testing(spl)
+
+rec <- recipe(engagement ~ ., data=tr) %>%
+  update_role(destinationstate, new_role="id") %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+mod <- linear_reg(penalty=tune(), mixture=tune()) %>% set_engine("glmnet")
+wf  <- workflow() %>% add_recipe(rec) %>% add_model(mod)
+
+vfold <- vfold_cv(tr, v=5)
+grid  <- grid_regular(penalty(range=c(-6,0)), mixture(), levels=7)
+
+res   <- tune_grid(wf, resamples=vfold, grid=grid, metrics=metric_set(rmse, rsq))
+best <- select_best(res, metric = "rmse")
+final <- finalize_workflow(wf, best) %>% fit(tr)
+
+coefs <- broom::tidy(extract_fit_parsnip(final)$fit)   # learned weights
+te_pred <- predict(final, new_data = te)
+te <- bind_cols(te, te_pred)
+
+collect_metrics(res)
+
+coefs
+
+te %>%
+  arrange(desc(.pred)) %>%
+  select(destinationstate, .pred) %>%
+  head(10)
+
+ggplot(te, aes(x = engagement, y = .pred)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(title = "Predicted vs Actual Engagement (Elastic Net)",
+       x = "Actual Engagement",
+       y = "Predicted Engagement")
+
+```
+```{r}
+df_clean <- df %>%
+  filter(!is.na(award_type)) %>%
+  mutate(award_group = ifelse(award_type == "Primary", "Primary", "Not Primary"))
+
+df_prop <- df_clean %>%
+  group_by(temperature_req, award_group) %>%
+  summarise(count = n()) %>%
+  group_by(temperature_req) %>%
+  mutate(prop = count / sum(count))
+
+ggplot(df_prop, aes(x = temperature_req, y = prop, fill = award_group)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Proportion of Primary vs Non-Primary Loads by Temperature Requirement",
+    x = "Temperature Requirement",
+    y = "Proportion of Loads",
+    fill = "Award Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+df_price <- df_bin %>%
+  mutate(rate_premium = (paid_linehaul - spot_linehaul) / pmax(spot_linehaul, 1e-6))
+
+df_price %>%
+  group_by(primary) %>%
+  summarise(n=n(), prem_mean = mean(rate_premium, na.rm=TRUE), prem_med = median(rate_premium, na.rm=TRUE), prem_sd = sd(rate_premium, na.rm=TRUE))
+
+ggplot(df_price, aes(x = primary, y = rate_premium)) +
+  geom_boxplot(outlier.alpha = .3) +
+  scale_y_continuous(labels = percent) +
+  labs(x="Primary?", y="Rate premium")
+```
+```{r}
+df1 <- df %>%
+  filter(!is.na(award_type),
+         mileage > 0,
+         paid_linehaul > 0) %>%
+  mutate(
+    award_group   = ifelse(award_type == "Primary", "Primary", "Not Primary"),
+    rate_per_mile = paid_linehaul / mileage
+  )
+
+ggplot(df1, aes(x = award_group, y = rate_per_mile, fill = award_group)) +
+  geom_boxplot(outlier.alpha = 0.25) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Rate per mile by Award Type",
+       x = NULL, y = "Paid $/mile") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+df1 %>%
+  group_by(award_group) %>%
+  summarise(n = n(),
+            mean_rpm = mean(rate_per_mile, na.rm = TRUE),
+            sd_rpm = sd(rate_per_mile, na.rm = TRUE)) %>%
+  mutate(mean_rpm = dollar(mean_rpm))
+
+t.test(rate_per_mile ~ award_group, data = df1)
+```
+
+

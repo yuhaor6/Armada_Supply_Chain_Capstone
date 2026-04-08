@@ -1,0 +1,163 @@
+---
+title: "Important Visualizations"
+author: "Aidan McIndoe"
+date: "2025-12-12"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+rm(list=ls())
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(arrow)
+library(lubridate)
+library(forcats)
+```
+
+```{r}
+files <- list.files(pattern = "CMU_ARMADA_LOADS_202403-202502_.*\\.xlsx$")
+files
+```
+
+```{r}
+# read and append
+dfs <- lapply(files, function(f) read_excel(f, guess_max = 100000))
+
+# force them all to character to avoid type mismatch
+dfs <- lapply(dfs, function(df) mutate_all(df, as.character))
+
+# append into one big dataframe
+combined <- bind_rows(dfs)
+
+combined <- readr::type_convert(combined, na = c("", "NA", "N/A", "NULL"))
+
+#names unified
+combined <- janitor::clean_names(combined)
+
+#choose numeric targets
+num_cols <- c(
+  "mileage","contract_linehaul","spot_linehaul","paid_linehaul","nap_linehaul",
+  "cube","weight","pieces","quantity","transit_time","number_of_stops"
+)
+
+char_num_cols <- intersect(
+  num_cols,
+  names(combined)[vapply(combined, is.character, logical(1))]
+)
+
+combined <- combined %>%
+  mutate(across(all_of(char_num_cols), readr::parse_number))
+```
+```{r}
+#parse month from TIME_PERIOD
+combined <- combined %>%
+  mutate(
+    time_period = as.character(time_period),
+    month_date  = lubridate::parse_date_time(time_period, orders = c("b_Y","B_Y")),
+    month       = lubridate::floor_date(month_date, "month")
+  )
+```
+
+```{r}
+combined %>%
+  group_by(destination_region) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count, y = "")) + geom_violin(alpha = 0.3, fill = "darkblue", adjust = 0.7) + geom_boxplot(alpha = 0.3, width = 0.2) + labs(title = "Destination Regions by Number of Loads", y = "", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  group_by(destination_region) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) + geom_histogram(fill = "darkblue") + labs(title = "Destination Regions by Number of Loads", y = "Frequency", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  group_by(destination_region) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) + geom_density(fill = "darkblue", adjust = 0.7) + labs(title = "Destination Regions by Number of Loads", y = "Density", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  group_by(lane) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count, y = "")) + geom_violin(alpha = 0.3, fill = "darkblue") + geom_boxplot(alpha = 0.3, width = 0.2) + labs(title = "Lanes by Number of Loads", y = "", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  group_by(lane) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) + geom_histogram(fill = "darkblue") + labs(title = "Lanes by Number of Loads", y = "Frequency", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  group_by(lane) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) + geom_density(fill = "darkblue") + labs(title = "Lanes by Number of Loads", y = "Density", x = "Number of Loads")
+```
+
+```{r}
+combined %>%
+  ggplot(aes(x = award_type)) + geom_bar(fill = "darkblue") + theme(axis.text.x = element_text(angle = 90)) + labs(title = "Tender Acceptance in the Data", x = "Award Type")
+```
+
+```{r}
+combined$primary <- ifelse(combined$award_type == "Primary", "Primary", ifelse(combined$award_type == "Waterfall #2" | combined$award_type == "Waterfall #3" | combined$award_type == "Waterfall #4" | combined$award_type == "Waterfall #5" | combined$award_type == "Waterfall #6", "Non-Primary", "No waterfall"))
+```
+
+```{r}
+table(combined$primary)
+```
+
+```{r}
+combined %>%
+  filter(primary == "Primary" | primary == "Non-Primary") %>%
+  ggplot(aes(x = primary)) + geom_bar(fill = "darkblue") + labs(title = "Loads by Primary Acceptance", x = "Primary Acceptance")
+```
+
+```{r}
+#Show the number of unique lanes
+
+length(unique(combined$lane))
+```
+
+```{r}
+combined %>%
+  filter(primary == "Primary" | primary == "Non-Primary") %>%
+  group_by(primary, temperature_req) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = primary, y = count, fill = temperature_req)) + geom_bar(stat = "identity", position = "fill") + labs(x = "Primary Acceptance", y = "Proportion", title = "Relative proportion of temperature controlled loads", fill = "Temperature Requirement")
+```
+
+```{r}
+combined %>%
+  filter(primary == "Primary" | primary == "Non-Primary") %>%
+  ggplot(aes(x = spot_linehaul, y = primary, fill = primary)) + geom_boxplot() + labs(title = "Do Acceptance Types differ by Price?", y = "Primary Acceptance", x = "Spot Rate", fill = "Primary Acceptance")
+```
+
+```{r}
+combined %>%
+  filter(primary == "Primary" | primary == "Non-Primary") %>%
+  ggplot(aes(x = mileage, y = primary, fill = primary)) + geom_boxplot() + labs(title = "Relative Mileage between Acceptance Types", y = "Primary Acceptance", x = "Mileage", fill = "Primary Acceptance")
+```
+
+
+```{r}
+combined %>%
+  filter(primary == "Primary" | primary == "Non-Primary") %>%
+  filter(load_lead_time <= 100000) %>%
+  ggplot(aes(x = load_lead_time, y = primary, fill = primary)) + geom_boxplot() + labs(title = "Relative Lead Time between Acceptance Types", y = "Primary Acceptance", x = "Load Lead Time", fill = "Primary Acceptance")
+```
+
